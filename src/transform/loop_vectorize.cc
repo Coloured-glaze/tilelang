@@ -424,6 +424,26 @@ private:
 
       buffer_vector_infos_.push_back({Buffer(), vectorize_length, false, {}});
       return arith::IRMutatorWithAnalyzer::VisitExpr_(node);
+    } else if (node->op.same_as(builtin::ptx_cp_async()) ||
+               node->op.same_as(tl::ptx_cp_async())) {
+      // cp.async supports byte sizes 4/8/16. For element-wise calls with small
+      // byte width (e.g., fp16 => 2 bytes), we rely on vectorization to fold
+      // multiple calls into one wider cp.async call.
+      int vectorize_length = 1;
+      ICHECK_GE(node->args.size(), 3U)
+          << "cp.async expects at least 3 arguments, but got " << node->args;
+      const auto *bytes_imm = node->args[2].as<IntImmNode>();
+      ICHECK(bytes_imm) << "cp.async byte count must be IntImm, but got "
+                        << node->args[2];
+      int bytes = static_cast<int>(bytes_imm->value);
+      for (int lanes : {16, 8, 4, 2, 1}) {
+        if (IsValidCPAsyncTransferBytes(bytes * lanes)) {
+          vectorize_length = lanes;
+          break;
+        }
+      }
+      buffer_vector_infos_.push_back({Buffer(), vectorize_length, false, {}});
+      return arith::IRMutatorWithAnalyzer::VisitExpr_(node);
     } else if (node->op == builtin::address_of() ||
                node->op == tl::access_ptr()) {
       // address_of and tl.access_ptr have buffer load value so we should
@@ -622,8 +642,18 @@ private:
   }
 
   PrimExpr VisitExpr_(const CastNode *node) final {
-    int cast_vector_size = arith::ZeroAwareGCD(
-        vector_load_bits_max_ / node->dtype.bits(), initial_vector_size_);
+    // Consider both source and target types to ensure all intermediate
+    // vector types can be represented. For example, casting int32 to
+    // float8_e4m3fn: target allows 128/8=16 lanes but int32 only supports
+    // up to 128/32=4 lanes in CUDA vector types.
+    int target_lanes = vector_load_bits_max_ / node->dtype.bits();
+    int source_bits = node->value.dtype().bits();
+    int max_lanes = target_lanes;
+    if (source_bits > 0) {
+      int source_lanes = vector_load_bits_max_ / source_bits;
+      max_lanes = std::min(target_lanes, source_lanes);
+    }
+    int cast_vector_size = arith::ZeroAwareGCD(max_lanes, initial_vector_size_);
     // Record cast constraint (use empty buffer to indicate cast)
     buffer_vector_infos_.push_back({Buffer(), cast_vector_size, false, {}});
     return arith::IRMutatorWithAnalyzer::VisitExpr_(node);

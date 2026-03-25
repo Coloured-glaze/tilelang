@@ -264,10 +264,6 @@ def create_tma_descriptor(*args):
     return tir.call_intrin("handle", tir.op.Op.get("tl.create_tma_descriptor"), *args)
 
 
-# NOTE(wt): T.create_list_of_mbarrier and T.get_mbarrier is now only an intermediate intrinsic
-# during transforms, and won't be exposed to frontend. For creating mbarriers, please use T.alloc_barrier instead.
-
-
 def tma_load(*args):
     """Perform a Tensor Memory Access (TMA) load operation.
 
@@ -278,6 +274,18 @@ def tma_load(*args):
         tir.Call: A handle to the TMA load operation
     """
     return tir.call_intrin("handle", tir.op.Op.get("tl.tma_load"), *args)
+
+
+def tma_load_2sm(*args):
+    """Perform a Tensor Memory Access (TMA) load operation with 2SM on Blackwell.
+
+    Args:
+        *args: Variable arguments specifying the TMA load parameters
+
+    Returns:
+        tir.Call: A handle to the TMA load operation
+    """
+    return tir.call_intrin("handle", tir.op.Op.get("tl.tma_load"), *args, annotations={"use_2cta": 1})
 
 
 def fence_proxy_async(*args):
@@ -364,6 +372,18 @@ def disable_warp_group_reg_alloc():
     return no_set_max_nreg()
 
 
+def ptx_arrive_cluster_barrier(mbarrier: BarrierType, cta_id: int | Var):
+    """Arrive at a shared barrier in cluster.
+
+    Args:
+        mbarrier: BarrierType
+            The memory barrier to arrive at
+        cta_id: int | Var
+            The peer CTA rank in cluster to arrive at.
+    """
+    return tir.call_intrin("handle", tir.op.Op.get("tl.ptx_arrive_cluster_barrier"), mbarrier, cta_id)
+
+
 def mbarrier_wait_parity(mbarrier: BarrierType, parity: int | Var):
     """Wait for memory barrier parity condition.
 
@@ -405,15 +425,22 @@ def mbarrier_wait_parity(mbarrier: BarrierType, parity: int | Var):
     return tir.call_intrin("handle", tir.op.Op.get("tl.mbarrier_wait_parity"), mbarrier, parity)
 
 
-def mbarrier_arrive(mbarrier: BarrierType):
+def mbarrier_arrive(mbarrier: BarrierType, cta_id: int | Var | None = None):
     """Arrive at memory barrier.
 
     Args:
         mbarrier: BarrierType
             The memory barrier to arrive at
+        cta_id: int | Var | None
+            The peer CTA rank in cluster to arrive at. (Only valid for cluster barriers)
+            If not provided, will arrive on current CTA's barrier.
     """
     mbarrier = _mbar_to_buffer_load(mbarrier)
-    return ptx_arrive_barrier(mbarrier)
+    if cta_id is not None:
+        assert mbarrier.buffer.scope() == "shared.cluster_barrier", f"mbarrier must be a cluster barrier, but got {mbarrier.buffer.scope}"
+        return ptx_arrive_cluster_barrier(mbarrier, cta_id)
+    else:
+        return ptx_arrive_barrier(mbarrier)
 
 
 def mbarrier_expect_tx(mbarrier: BarrierType, tx: int):
@@ -980,17 +1007,21 @@ def cp_async_barrier_noinc(barrier: BarrierType):
     return tir.call_intrin("handle", tir.op.Op.get("tl.ptx_cp_async_barrier_noinc"), barrier)
 
 
-def tcgen05_mma_arrive(mbar: tir.Buffer | BufferLoad | PrimExpr):
+def tcgen05_mma_arrive(mbar: tir.Buffer | BufferLoad | PrimExpr, arrive_2cta: bool = False):
     """Signal UMMA (TCGEN05) barrier arrival for a shared-memory mbarrier pointer.
 
     Parameters
     ----------
     mbar: tir.Buffer | BufferLoad | PrimExpr
         The mbarrier object in shared memory (e.g., Barrier*) or its address.
+    arrive_2cta: bool
+        Whether to also arrive at the peer CTA's barrier.
+        If set, will be lowered to umma_arrive_multicast_2x1SM.
     """
     if isinstance(mbar, (tir.Buffer, BufferLoad)):
         mbar = retrieve_ptr(mbar, access_type="rw")
-    return tir.call_intrin("void", tir.op.Op.get("tl.tcgen05_mma_arrive"), mbar)
+    ann = {"use_2cta": 1} if arrive_2cta else {}
+    return tir.call_intrin("void", tir.op.Op.get("tl.tcgen05_mma_arrive"), mbar, annotations=ann)
 
 
 def ptx_mma_sm70(
